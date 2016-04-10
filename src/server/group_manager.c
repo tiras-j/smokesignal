@@ -14,7 +14,7 @@
 #include "hashmap.h"
 
 #define RESET_TIME 300 //5 minutes
-#define DEFAUL_MAX_LISTENERS 128
+#define DEFAULT_MAX_LISTENERS 128
 
 struct group_file {
 	int fd;
@@ -56,6 +56,17 @@ static void realloc_listener_array(struct group_file *gfile) {
 	gfile->max_listeners = new_max_listeners; 
 }
 
+static void extend_mapped_file(struct group_file *gfile)
+{
+	size_t new_size = gfile->mapped_size * 2;
+	// We know gfile->mapped_size is a page multiple.
+	// So we're just going to double it.
+	ftruncate(gfile->fd, new_size);
+	munmap(gfile->mmap_addr, gfile->mapped_size);
+	gfile->mmap_addr = mmap(NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, gfile->fd, 0);
+	gfile->mapped_size = new_size;
+}
+	
 static struct group_file *create_or_open_group_file(char *file_path)
 {
 	struct stat statb;
@@ -64,7 +75,10 @@ static struct group_file *create_or_open_group_file(char *file_path)
 
 	if(stat(file_path, &statb) == -1) {
 		if(errno == ENOENT) {
+			// TODO: Fix this to not open fd, close fd, and reopen fd
+			// that's just silly.
 			int fd = open(file_path, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+			ftruncate(fd, getpagesize());
 			close(fd);
 			stat(file_path, &statb);
 		}else {
@@ -93,7 +107,6 @@ static struct group_file *create_or_open_group_file(char *file_path)
 		gfile->num_entries++;
 		memptr++;
 	}
-
 	return gfile;
 }
 
@@ -175,14 +188,13 @@ int group_exists(char *name)
 	return 0;
 }
 
-int retrieve_group_fd(char *name)
+const char *retrieve_group_members(char *name)
 {
 	struct group_file *gfile;
-
 	if((gfile = (struct group_file *)map_get(group_map, name)) == NULL)
-		return -1;
+		return NULL;
 
-	return gfile->fd
+	return (const char *)gfile->mmap_addr;
 }
 
 int create_group(char *name)
@@ -207,13 +219,29 @@ int delete_group(char *name)
 
 int join_group(char *name, char *ip_addr, int *port_array, int num_ports)
 {
+	char buf[128];
+	struct group_file *gfile;
+	int idx;
+	int current_offset;
 
+	if((gfile = map_get(group_map, name)) == NULL)
+		return -1;
+
+	current_offset = strlen((char*)gfile->mmap_addr);
+
+	for(idx = 0; idx < num_ports; ++idx) {
+		snprintf(buf, 128, "%s:%d,", ip_addr, port_array[idx]);
+		if(current_offset + strlen(buf) > gfile->mapped_size - 1)
+			extend_mapped_file(gfile);
+
+		strcpy((char*)gfile->mmap_addr + current_offset, buf);
+		current_offset += strlen(buf);
+	}
 
 	return 0;
 }
 int leave_group(char *name, char *ip_addr)
 {
-
 	return 0;
 }
 int sub_group(char *name, int sockfd)
