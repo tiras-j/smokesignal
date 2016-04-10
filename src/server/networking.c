@@ -16,6 +16,7 @@
 // that's map string -> void*.
 
 typedef void (*event_callback_t)(int, void*);
+typedef void (*handler_t)(char*, size_t);
 
 struct fd_data {
 	int fd;
@@ -24,6 +25,8 @@ struct fd_data {
 	struct fd_callback *next;
 };
 
+static handler_t handler = NULL;
+
 // Global event structure
 static struct epoll_event ev, events[MAX_EVENTS];
 // Global fds
@@ -31,7 +34,8 @@ static int epollfd, listenfd;
 // Simple hash table
 struct fd_data *hashtable[DEFAULT_HT_SIZE] = {0};
 
-void insert_hashtable(struct fd_data *fdata) {
+static void 
+insert_hashtable(struct fd_data *fdata) {
 	struct fd_data *p, *prev;
 	int idx = fdcb->fd % DEFAULT_HT_SIZE;
 
@@ -47,7 +51,8 @@ void insert_hashtable(struct fd_data *fdata) {
 	}
 }
 
-struct fd_data *fetch_hashtable(int fd)
+static struct fd_data *
+fetch_hashtable(int fd)
 {
 	struct fd_data *p;
 	int idx = fd % DEFAULT_HT_SIZE;
@@ -58,7 +63,8 @@ struct fd_data *fetch_hashtable(int fd)
 	return p;
 }
 
-struct fd_data *remove_hashtable(int fd)
+static struct fd_data *
+remove_hashtable(int fd)
 {
 	struct fd_data *p, *prev = NULL;
 	int idx = fd % DEFAULT_HT_SIZE;
@@ -79,8 +85,67 @@ struct fd_data *remove_hashtable(int fd)
 	}
 	return p;
 }
-	
-void accept_cb(int sockfd, void *context)
+static void
+handle_message(int sockfd, void *context)
+{
+	char *msg = NULL;
+	size_t buf_sz = 0;
+	uint32_t msg_sz = 0;
+	uint32_t remaining = 0;
+	int ret;
+
+	while(1) {
+		// Get header
+		ret = recv(sockfd, &msg_sz, sizeof(uint32_t), 0);
+		if(ret == 0) {
+			// Client closed connection
+			fprintf(stderr, "Client closed connection");
+			close(sockfd);
+			break;
+		} else if(ret == -1) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				break;
+			perror("read");
+			close(sockfd);
+			break;
+		}
+
+		msg_sz = ntohl(msg_sz);
+		remaining = msg_sz;
+		if((msg = malloc(msg_sz)) == NULL)
+			break;
+
+		// For now we're going to block until we read msg_sz bytes
+		// off this socket. However in the future we may save the 
+		// state in *context so we can return instead of block and
+		// handle the rest on the next event trigger
+		while(remaining) {
+			ret = recv(sockfd, msg, remaining, 0);
+			if(ret == 0) {
+				// Client closed connection
+				fprintf(stderr, "Client closed connection");
+				close(sockfd);
+				free(msg);
+				break;
+			} else if(ret == -1) {
+				if (errno == EAGAIN || errno == EWOULDBLOCK)
+					continue;
+				perror("read");
+				close(sockfd);
+				free(msg);
+				break;
+			}
+			remaining -= ret;
+		}
+
+		// Invoke handler with message
+		handler(msg, msg_sz);
+		free(msg);
+	}
+}
+
+static void 
+accept_cb(int sockfd, void *context)
 {
 	struct sockaddr_in client_addr;
 	struct fd_data *fdata;
@@ -122,7 +187,8 @@ void accept_cb(int sockfd, void *context)
 
 }
 
-static int set_nonblocking(int fd)
+static int 
+set_nonblocking(int fd)
 {
 	int sock_flags = fcntl(fd, F_GETFL, 0);
 	if(sock_flags < 0) {
@@ -144,11 +210,17 @@ static int set_nonblocking(int fd)
 	return 0;
 }
 
-int init_networking(int port) // For now a raw int port, eventually a configuration object
+int 
+init_networking(int port, handler_t h_func) // For now a raw int port, eventually a configuration object
 {
 	struct addrinfo hints, *servinfo, *p;
 	struct fd_data *fdata;
 	int rv, optval = 1;
+
+	// For now only a single handler function. In the future
+	// perhaps allow a series of handler which will be chained
+	handler = h_func; 
+
 	// Set up the epoll structure, bind the listen socket etc.
 	if((epollfd = epoll_create1(0)) == -1) {
 		perror("epoll_create1");
