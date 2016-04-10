@@ -298,3 +298,26 @@ init_networking(int port, handler_t h_func) // For now a raw int port, eventuall
 
 	return 0;
 }
+
+void 
+start_networking_loop()
+{
+	int numfds, idx;
+	struct fd_data *fdata;
+	// I need to set up some signal handlers soon
+	while(1) {
+		numfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
+		if(numfds == -1) {
+			perror("epoll_wait");
+		}
+
+		for(idx = 0; idx < numfds; ++idx) {
+			fdata = fetch_hashtable(events[idx].data.fd);
+			if(fdata == NULL) {
+				fprintf(stderr, "Failed to retrieve fd data");
+				continue;
+			}
+			fdata->cb_func(fdata->fd, fdata->context);
+		}
+	}
+}
