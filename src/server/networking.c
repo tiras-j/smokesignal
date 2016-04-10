@@ -29,7 +29,7 @@ static struct epoll_event ev, events[MAX_EVENTS];
 // Global fds
 static int epollfd, listenfd;
 // Simple hash table
-struct fd_data *hashtable[DEFAULT_HT_SIZE];
+struct fd_data *hashtable[DEFAULT_HT_SIZE] = {0};
 
 void insert_hashtable(struct fd_data *fdata) {
 	struct fd_data *p, *prev;
