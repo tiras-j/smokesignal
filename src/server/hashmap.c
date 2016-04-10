@@ -49,6 +49,7 @@ void* initialize_map() {
 	}
 	
 	if((new_map->buckets = calloc(DEFAULT_BUCKETS, sizeof(struct bucket))) == NULL) {
+		free(new_map);
 		return NULL;
 	}
 
@@ -57,9 +58,36 @@ void* initialize_map() {
 }
 
 void realloc_map(void *map) {
-	// TODO: implement
-}
+	struct hash_map *new_map;
+	struct hash_map *hmap = (struct hash_map *)map;
+	struct hash_entry *entry_ptr;
+	int idx, new_bucket_count = hmap->num_buckets * 2;
 
+	if((new_map = malloc(sizeof(struct hash_map))) == NULL) {
+		return NULL;
+	}
+
+	if((new_map->buckets = calloc(new_bucket_count, sizeof(struct bucket))) == NULL) {
+		free(new_map);
+		return NULL;
+	}
+
+	new_map->num_buckets = new_bucket_count;
+
+	// Iterate over map and re-insert to new map.
+	for(idx = 0; idx < hmap->num_buckets; ++idx) {
+		entry_ptr = hmap->buckets[idx]->head;
+		while(bucket_ptr != NULL) {
+			map_put(new_map, entry_ptr->key, entry_ptr->data);
+			entry_ptr = entry_ptr->next_entry;
+		}
+		free(hmap->buckets[idx]);
+	}
+	free(hmap);
+
+	map = (void*)new_map;
+}
+	
 int map_put(void *map, char *key, void* data) {
 	unsigned long hash_value;
 	struct hash_map *hmap;
