@@ -12,7 +12,7 @@ int initialize_group_manager();
 int group_exists(char *name);
 int create_group(char *name);
 int delete_group(char *name);
-int join_group(char *name, char *ip_addr, int *port_array, int num_ports);
+int join_group(char *name, char *ip_addr);
 int leave_group(char *name, char *ip_addr);
 int sub_group(char *name, int sockfd);
 int unsub_group(char *name, int sockfd);

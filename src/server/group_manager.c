@@ -15,6 +15,7 @@
 
 #define RESET_TIME 300 //5 minutes
 #define DEFAULT_MAX_LISTENERS 128
+#define MAX_IP4_STRING_SIZE 21 // xxx.xxx.xxx.xxx:ppppp -> 21 characters, we only support IPv4 atm
 
 struct group_file {
 	int fd;
@@ -149,6 +150,15 @@ static int open_existing_groups(DIR *dir)
 
 	return 0;
 }
+
+static int already_member(struct group_file *gfile, char *member)
+{
+	const char *memptr = (const char *)gfile->mmap_addr;
+	if(strstr(memptr, member) != NULL)
+		return 1;
+	return 0;
+}
+
 /* Exposed Functions */
 int initialize_group_manager()
 {
@@ -205,45 +215,86 @@ int create_group(char *name)
 		return map_put(group_map, gfile->group_name, (void *)gfile);
 	return -1;
 }
+// Should this delete the underlying file?
+// for now we are
 int delete_group(char *name)
 {
 	struct group_file *gfile;
 	gfile = map_remove(group_map, name);
 	if(gfile) {
+		char *file_path = build_path(DEFAULT_DIR, gfile->group_name);
 		munmap(gfile->mmap_addr, gfile->mapped_size);
 		close(gfile->fd);
+		if(file_path) {
+			unlink(file_path);
+			free(file_path);
+		}
 		free(gfile);
 	}
 	return 0;
 }
 
-int join_group(char *name, char *ip_addr, int *port_array, int num_ports)
+/* For now we're putting it on the user to compose the ip:port string
+ * and to have to call in a single ip/port at a time, if they have 
+ * multiple they need to deal with it by making multiple calls.
+ * This simplifies things on our end and satisfies the typical use case.
+ */
+int join_group(char *name, char *ip_addr)
 {
-	char buf[128];
+	// ip_addr should be form "x.x.x.x:port"
+	char buf[64];
 	struct group_file *gfile;
-	int idx;
 	int current_offset;
-
+	
 	if((gfile = map_get(group_map, name)) == NULL)
 		return -1;
 
+	// Set the buf, add comma, perhaps do sanitization later.
+	if(strlen(ip_addr) > MAX_IP4_STRING_SIZE)
+		return -1;
+
+	snprintf(buf, 64, "%s,", ip_addr);
+
+	if(already_member(gfile, buf))
+		return 0;
+	
 	current_offset = strlen((char*)gfile->mmap_addr);
 
-	for(idx = 0; idx < num_ports; ++idx) {
-		snprintf(buf, 128, "%s:%d,", ip_addr, port_array[idx]);
-		if(current_offset + strlen(buf) > gfile->mapped_size - 1)
-			extend_mapped_file(gfile);
+	// The -1 is to maintain a single null terminator at the end
+	// of the mmap so we can pass it as a string
+	if(current_offset + strlen(buf) > gfile->mapped_size - 1)
+		extend_mapped_file(gfile);
 
-		strcpy((char*)gfile->mmap_addr + current_offset, buf);
-		current_offset += strlen(buf);
-	}
-
+	strcpy((char*)gfile->mmap_addr + current_offset, buf);
+	current_offset += strlen(buf);
 	return 0;
 }
+
 int leave_group(char *name, char *ip_addr)
 {
+	struct group_file *gfile;
+	char *memptr, *start_del, *end_del, *end_file;
+	size_t bytes_to_move, bytes_to_clear;
+	
+	if((gfile = map_get(group_map, name)) == NULL)
+		return -1;
+
+	if(!already_member(gfile, ip_addr))
+		return 0;
+
+	memptr = (char *)gfile->mmap_addr;
+	end_file = memptr + strlen(memptr);
+	start_del = strstr(memptr, ip_addr);
+	end_del = start_del + strlen(ip_addr);  
+	bytes_to_move = end_file - end_del;
+	bytes_to_clear = strlen(ip_addr);
+	
+	memcpy(start_del, end_del + 1, bytes_to_move); 
+	memset(end_file - bytes_to_clear, 0, bytes_to_clear);
+
 	return 0;
 }
+
 int sub_group(char *name, int sockfd)
 {
 	struct group_file *gfile;
