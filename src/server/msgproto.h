@@ -17,15 +17,16 @@
 /* TYPE|GLEN|GROUPNAME|STRLEN|(IP/CDN):PORT string */
 #define JOINGROUP 1
 #define LEAVEGROUP 2
+#define HEALTHCHECK 3
 
 /*  1  |  1 |   N     |  2   |      N          BYTES*/
 /* TYPE|GLEN|GROUPNAME|MSGLEN|MSG(untouched) */
-#define BROADCAST 3 // Broadcast sends to LISTENERS of a group, not group members themselves
+#define BROADCAST 4 // Broadcast sends to LISTENERS of a group, not group members themselves
 
 /*  1  | 1  |   N      */
 /* TYPE|GLEN|GROUPNAME */
-#define LEAVEGROUP 4
-#define HEALTHCHECK 5
-#define LISTMEMBERS 6
+#define SUBGROUP 5
+#define UNSUBGROUP 6
+#define LISTMEMBERS 7
 
 #endif /* _MSGPROTO_H */
