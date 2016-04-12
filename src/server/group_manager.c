@@ -21,7 +21,6 @@ struct group_file {
 	int fd;
 	void *mmap_addr;
 	size_t mapped_size;
-	int num_entries;
 	char group_name[256]; /* linux max file name size */
 	int num_listeners;
 	int max_listeners;
@@ -29,13 +28,14 @@ struct group_file {
 };
 
 static void *group_map = NULL;
+static void *health_map = NULL;
 static char *DEFAULT_DIR = "/tmp/.groups";
 static char *TIMESTAMP_FILE = ".lasttime";
 
 /* Local functions */
 static char *build_path(char *p1, char *p2) {
 	char *new_path;
-	
+
 	// +2 for '/' + null term
 	new_path = malloc(strlen(p1) + strlen(p2) + 2);
 	strcpy(new_path, p1);
@@ -102,12 +102,6 @@ static struct group_file *create_or_open_group_file(char *file_path)
 	gfile->max_listeners = DEFAULT_MAX_LISTENERS;
 	gfile->listener_fd_array = malloc(sizeof(int) * DEFAULT_MAX_LISTENERS);
 
-	// Finally, iterates for ',' in file and count entries in there
-	memptr = (char *)gfile->mmap_addr;
-	while(memptr < ((char*)gfile->mmap_addr + gfile->mapped_size) && (memptr = strchr(memptr, ',')) != NULL) {
-		gfile->num_entries++;
-		memptr++;
-	}
 	return gfile;
 }
 
@@ -167,6 +161,10 @@ int initialize_group_manager()
 	if((group_map = initialize_map()) == NULL) {
 		return -1;
 	}
+
+    if((health_map = initialize_map()) == NULL) {
+        return -1;
+    }
 
 	if((groups_dir = opendir(DEFAULT_DIR)) == NULL) {
 		if(errno == ENOENT) {
@@ -242,22 +240,27 @@ int delete_group(char *name)
 int join_group(char *name, char *ip_addr)
 {
 	// ip_addr should be form "x.x.x.x:port"
-	char buf[64];
+	char buf[256];
 	struct group_file *gfile;
 	int current_offset;
-	
+    time_t *time_ptr;
+
 	if((gfile = map_get(group_map, name)) == NULL)
 		return -1;
 
 	// Set the buf, add comma, perhaps do sanitization later.
-	if(strlen(ip_addr) > MAX_IP4_STRING_SIZE)
+	if(strlen(ip_addr) > 254)
 		return -1;
 
-	snprintf(buf, 64, "%s,", ip_addr);
+    // Add to health map
+    time_ptr = malloc(sizeof(*time_ptr));
+    time(time_ptr);
+    map_put(health_map, ip_addr, (void*)time_ptr);
+
+	snprintf(buf, 256, "%s,", ip_addr);
 
 	if(already_member(gfile, buf))
 		return 0;
-	
 	current_offset = strlen((char*)gfile->mmap_addr);
 
 	// The -1 is to maintain a single null terminator at the end
@@ -268,6 +271,25 @@ int join_group(char *name, char *ip_addr)
 	strcpy((char*)gfile->mmap_addr + current_offset, buf);
 	current_offset += strlen(buf);
 	return 0;
+}
+
+int healthcheck_group(char *name, char *ip_addr)
+{
+    time_t *time_ptr;
+    struct group_file *gfile;
+
+    if((gfile = map_get(group_map, name)) == NULL)
+        return -1;
+
+    if(!already_member(gfile, ip_addr))
+        return -1;
+
+    if((time_ptr = map_get(health_map, ip_addr)) == NULL)
+        return -1;
+
+    time(time_ptr);
+
+    return 0;
 }
 
 int leave_group(char *name, char *ip_addr)
