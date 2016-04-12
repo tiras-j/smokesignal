@@ -12,6 +12,8 @@
 #include <fcntl.h>
 #include <stdio.h>
 
+#include "msgproto.h"
+
 #define MAX_EVENTS 1024 // Max pending events to handle per epoll_wait call
 #define DEFAULT_HT_SIZE 64
 #define BACKLOG 10
@@ -20,7 +22,7 @@
 // It'd be nice to reuse the hash table I made for group_manager but 
 // that's map string -> void*.
 
-typedef int (*event_callback_t)(int, void*);
+typedef void (*event_callback_t)(int, void*);
 typedef void (*handler_t)(char*, size_t);
 
 struct fd_data {
@@ -90,6 +92,16 @@ remove_hashtable(int fd)
 	}
 	return p;
 }
+
+static void
+clean_up_sock(int sockfd)
+{
+    struct fd_data *fdata = remove_hashtable(sockfd);
+    if(fdata)
+        free(fdata);
+    close(sockfd);
+}
+
 static int
 clear_or_find_next_magic(int sockfd)
 {
@@ -101,41 +113,34 @@ clear_or_find_next_magic(int sockfd)
         ret = recv(sockfd, &buf, sizeof(uint32_t), 0);
         if(ret == 0) {
             fprintf(stderr, "Client closed connection\n");
-            close(sockfd);
-            return -1;
+            clean_up_sock(sockfd);
+            break;
         } else if(ret == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 break;
             perror("Finding magic");
-            close(sockfd);
-            return -1;
+            clean_up_sock(sockfd);
+            break;
         }
         buf = ntohl(buf);
         if(buf == SMOKEMAGIC)
             return 1;
     }
-
     return 0;
 }
+
 static void
 handle_message(int sockfd, void *context)
 {
 	char *msg = NULL;
 	size_t buf_sz = 0;
-	uint32_t msg_sz = 0, magic = 0;
+	uint32_t msg_sz = 0;
 	uint32_t remaining = 0;
 	int ret;
 
-    // First check SMOKEMAGIC
-    ret = recv(sockfd, &magic, sizeof(uint32_t), 0);
-    // We're guaranteed to have data here, otherwise we 
-    // wouldn't have epoll'd this socket.
-    magic = ntohl(magic);
-    if(magic != SMOKEMAGIC) {
-        ret = clear_or_find_next_magic(sockfd);
-        if(ret <= 0)
-            return ret;
-    }
+    /* Check valid magic */
+    if(!clear_or_find_next_magic(sockfd))
+        return;
 
 	while(1) {
 		// Get header
@@ -143,14 +148,14 @@ handle_message(int sockfd, void *context)
 		if(ret == 0) {
 			// Client closed connection
 			fprintf(stderr, "Client closed connection\n");
-			close(sockfd);
-            return -1;
+            clean_up_sock(sockfd);
+            break;
 		} else if(ret == -1) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				break;
 			perror("read");
-			close(sockfd);
-            return -1;
+            clean_up_sock(sockfd);
+            break;
 		}
 
 		msg_sz = ntohl(msg_sz);
@@ -167,16 +172,16 @@ handle_message(int sockfd, void *context)
 			if(ret == 0) {
 				// Client closed connection
 				fprintf(stderr, "Client closed connection\n");
-				close(sockfd);
 				free(msg);
-                return -1;
+                clean_up_sock(sockfd);
+                return;
 			} else if(ret == -1) {
 				if (errno == EAGAIN || errno == EWOULDBLOCK)
 					continue;
 				perror("read");
-				close(sockfd);
 				free(msg);
-                return -1;
+                clean_up_sock(sockfd);
+                return;
 			}
 			remaining -= ret;
 		}
@@ -185,7 +190,7 @@ handle_message(int sockfd, void *context)
 		handler(msg, msg_sz);
 		free(msg);
 	}
-    return 0;
+    return;
 }
 
 static int
@@ -350,11 +355,7 @@ start_networking_loop()
 				fprintf(stderr, "Failed to retrieve fd data\n");
 				continue;
 			}
-			ret = fdata->cb_func(fdata->fd, fdata->context);
-            if(ret == -1) {
-                fdata = remove_hashtable(fdata->fd);
-                free(fdata);
-            }
+			fdata->cb_func(fdata->fd, fdata->context);
 		}
 	}
 }
