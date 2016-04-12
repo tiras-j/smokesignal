@@ -4,25 +4,30 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <errno.h>
+#include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <string.h>
+#include <fcntl.h>
+#include <stdio.h>
 
 #define MAX_EVENTS 1024 // Max pending events to handle per epoll_wait call
 #define DEFAULT_HT_SIZE 64
+#define BACKLOG 10
 
 // I'd like to have a hash table int -> (fd struct/parse_func)...
 // It'd be nice to reuse the hash table I made for group_manager but 
 // that's map string -> void*.
 
-typedef void (*event_callback_t)(int, void*);
+typedef int (*event_callback_t)(int, void*);
 typedef void (*handler_t)(char*, size_t);
 
 struct fd_data {
 	int fd;
 	void *context; // State maintained by cb if needed
 	event_callback_t cb_func;
-	struct fd_callback *next;
+	struct fd_data *next;
 };
 
 static handler_t handler = NULL;
@@ -34,10 +39,10 @@ static int epollfd, listenfd;
 // Simple hash table
 struct fd_data *hashtable[DEFAULT_HT_SIZE] = {0};
 
-static void 
+static void
 insert_hashtable(struct fd_data *fdata) {
 	struct fd_data *p, *prev;
-	int idx = fdcb->fd % DEFAULT_HT_SIZE;
+	int idx = fdata->fd % DEFAULT_HT_SIZE;
 
 	p = hashtable[idx];
 	if(p == NULL) {
@@ -68,7 +73,7 @@ remove_hashtable(int fd)
 {
 	struct fd_data *p, *prev = NULL;
 	int idx = fd % DEFAULT_HT_SIZE;
-	
+
 	p = hashtable[idx];
 	while(p != NULL && p->fd != fd) {
 		prev = p;
@@ -85,29 +90,67 @@ remove_hashtable(int fd)
 	}
 	return p;
 }
+static int
+clear_or_find_next_magic(int sockfd)
+{
+    /* Called in the event of invalid SMOKEMAGIC */
+    uint32_t buf;
+    int ret;
+
+    while(1) {
+        ret = recv(sockfd, &buf, sizeof(uint32_t), 0);
+        if(ret == 0) {
+            fprintf(stderr, "Client closed connection\n");
+            close(sockfd);
+            return -1;
+        } else if(ret == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+            perror("Finding magic");
+            close(sockfd);
+            return -1;
+        }
+        buf = ntohl(buf);
+        if(buf == SMOKEMAGIC)
+            return 1;
+    }
+
+    return 0;
+}
 static void
 handle_message(int sockfd, void *context)
 {
 	char *msg = NULL;
 	size_t buf_sz = 0;
-	uint32_t msg_sz = 0;
+	uint32_t msg_sz = 0, magic = 0;
 	uint32_t remaining = 0;
 	int ret;
+
+    // First check SMOKEMAGIC
+    ret = recv(sockfd, &magic, sizeof(uint32_t), 0);
+    // We're guaranteed to have data here, otherwise we 
+    // wouldn't have epoll'd this socket.
+    magic = ntohl(magic);
+    if(magic != SMOKEMAGIC) {
+        ret = clear_or_find_next_magic(sockfd);
+        if(ret <= 0)
+            return ret;
+    }
 
 	while(1) {
 		// Get header
 		ret = recv(sockfd, &msg_sz, sizeof(uint32_t), 0);
 		if(ret == 0) {
 			// Client closed connection
-			fprintf(stderr, "Client closed connection");
+			fprintf(stderr, "Client closed connection\n");
 			close(sockfd);
-			break;
+            return -1;
 		} else if(ret == -1) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				break;
 			perror("read");
 			close(sockfd);
-			break;
+            return -1;
 		}
 
 		msg_sz = ntohl(msg_sz);
@@ -123,17 +166,17 @@ handle_message(int sockfd, void *context)
 			ret = recv(sockfd, msg, remaining, 0);
 			if(ret == 0) {
 				// Client closed connection
-				fprintf(stderr, "Client closed connection");
+				fprintf(stderr, "Client closed connection\n");
 				close(sockfd);
 				free(msg);
-				break;
+                return -1;
 			} else if(ret == -1) {
 				if (errno == EAGAIN || errno == EWOULDBLOCK)
 					continue;
 				perror("read");
 				close(sockfd);
 				free(msg);
-				break;
+                return -1;
 			}
 			remaining -= ret;
 		}
@@ -142,17 +185,41 @@ handle_message(int sockfd, void *context)
 		handler(msg, msg_sz);
 		free(msg);
 	}
+    return 0;
 }
 
-static void 
-accept_cb(int sockfd, void *context)
+static int
+set_nonblocking(int fd)
+{
+	int sock_flags = fcntl(fd, F_GETFL, 0);
+	if(sock_flags < 0) {
+		perror("fcntl: GETFL");
+		return -1;
+	}
+
+	if(fcntl(fd, F_SETFL, sock_flags | O_NONBLOCK)) {
+		perror("fcntl: SETFL");
+		return -1;
+	}
+
+	sock_flags = 1;
+	if(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *)&sock_flags, sizeof(int)))
+		perror("TCP_NODELAY");
+	if(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &sock_flags, sizeof(int)))
+		perror("SO_KEEPALIVE");
+
+	return 0;
+}
+
+static void
+accept_cb()
 {
 	struct sockaddr_in client_addr;
 	struct fd_data *fdata;
 	int client_addr_len = sizeof(client_addr);
 	int client_fd;
 
-	if((client_fd = accept(sockfd, (struct sockaddr *)&client_addr, &client_addr_len)) == -1) {
+	if((client_fd = accept(listenfd, (struct sockaddr *)&client_addr, &client_addr_len)) == -1) {
 		perror("accept");
 		return;
 	}
@@ -172,7 +239,7 @@ accept_cb(int sockfd, void *context)
 	// For now no context, but in the future we might add a struct
 	// for storing data between events if we don't get a full message
 	// in one read and need to know how much more to expect between events
-	fdata->context = NULL; 
+	fdata->context = NULL;
 
 	insert_hashtable(fdata);
 
@@ -182,44 +249,19 @@ accept_cb(int sockfd, void *context)
 		perror("epoll_ctl: client_fd");
 		close(client_fd);
 		free(fdata);
-		return;
 	}
-
 }
 
-static int 
-set_nonblocking(int fd)
-{
-	int sock_flags = fcntl(fd, F_GETFL, 0);
-	if(sock_flags < 0) {
-		perror("fcntl: GETFL");
-		return -1;
-	}
 
-	if(fcntl(fd, F_SETFL, sock_flags | O_NONBLOCK)) {
-		perror("fcntl: SETFL");
-		return -1;
-	}
-
-	sock_flags = 1;
-	if(setsockopt(fd, IPROTO_TCP, TCP_NODELAY, (char *)&sock_flags, sizeof(int)))
-		perror("TCP_NODELAY");
-	if(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &sock_flags, sizeof(int)))
-		perror("SO_KEEPALIVE");
-
-	return 0;
-}
-
-int 
-init_networking(int port, handler_t h_func) // For now a raw int port, eventually a configuration object
+int
+init_networking(const char* port, handler_t h_func) // For now a raw int port, eventually a configuration object
 {
 	struct addrinfo hints, *servinfo, *p;
-	struct fd_data *fdata;
 	int rv, optval = 1;
 
 	// For now only a single handler function. In the future
 	// perhaps allow a series of handler which will be chained
-	handler = h_func; 
+	handler = h_func;
 
 	// Set up the epoll structure, bind the listen socket etc.
 	if((epollfd = epoll_create1(0)) == -1) {
@@ -232,7 +274,7 @@ init_networking(int port, handler_t h_func) // For now a raw int port, eventuall
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_flags = AI_PASSIVE;
 
-	if((rv = getaddrinfo(NULL, PORT, &hints, &servinfo)) != 0) {
+	if((rv = getaddrinfo(NULL, port, &hints, &servinfo)) != 0) {
 		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
 		return -1;
 	}
@@ -275,19 +317,6 @@ init_networking(int port, handler_t h_func) // For now a raw int port, eventuall
 		return -1;
 	}
 
-	// Build fd struct, add to epoll and then return
-	if((fdata = malloc(sizeof(struct fd_data))) == NULL) {
-		fprintf(stderr, "malloc");
-		close(listenfd);
-		return -1;
-	}
-
-	fdata->fd = listenfd;
-	fdata->cb_func = &accept_cb;
-	fdata->context = NULL; // No state to keep
-
-	insert_hashtable(fdata);
-	
 	ev.events = EPOLLIN; // listen socket is level triggered, NOT edge triggered
 	ev.data.fd = listenfd;
 	if(epoll_ctl(epollfd, EPOLL_CTL_ADD, listenfd, &ev) == -1) {
@@ -299,10 +328,10 @@ init_networking(int port, handler_t h_func) // For now a raw int port, eventuall
 	return 0;
 }
 
-void 
+void
 start_networking_loop()
 {
-	int numfds, idx;
+	int numfds, idx, ret;
 	struct fd_data *fdata;
 	// I need to set up some signal handlers soon
 	while(1) {
@@ -312,12 +341,20 @@ start_networking_loop()
 		}
 
 		for(idx = 0; idx < numfds; ++idx) {
+            if(events[idx].data.fd == listenfd) {
+                accept_cb();
+                continue;
+            }
 			fdata = fetch_hashtable(events[idx].data.fd);
 			if(fdata == NULL) {
-				fprintf(stderr, "Failed to retrieve fd data");
+				fprintf(stderr, "Failed to retrieve fd data\n");
 				continue;
 			}
-			fdata->cb_func(fdata->fd, fdata->context);
+			ret = fdata->cb_func(fdata->fd, fdata->context);
+            if(ret == -1) {
+                fdata = remove_hashtable(fdata->fd);
+                free(fdata);
+            }
 		}
 	}
 }
