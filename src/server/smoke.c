@@ -4,12 +4,12 @@
 #include "networking.h"
 #include "group_manager.h"
 
-void handle_msg(char *msg, size_t msg_size)
+void handle_msg(char *msg, size_t msg_sz)
 {
 	char *buf;
 	// msg does not contain null terminator!
-	buf = malloc(msg_size + 1);
-	strncpy(buf, msg, msg_size);
+	buf = malloc(msg_sz + 1);
+	strncpy(buf, msg, msg_sz);
 	buf[msg_sz] = 0;
 
 	printf("Msg: %s\n", buf);
@@ -18,7 +18,7 @@ void handle_msg(char *msg, size_t msg_size)
 
 int main(int argc, char *argv[]) {
 	printf("Initializing...\n");
-	init_networking(51511, &handle_msg);
+	init_networking("51511", &handle_msg);
 	printf("Starting server\n");
 	start_networking_loop();
 	return 0;
